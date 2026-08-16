@@ -33,12 +33,14 @@ try
     builder.Services.AddScoped(sp => (IAccountManager)sp.GetRequiredService<AuthenticationStateProvider>());
 
 // configure client for auth interactions
-    builder.Services.AddHttpClient("SecureApi",opt => opt.BaseAddress = new Uri(builder.Configuration["BackendUrl"] ?? "https://localhost:5001"))
+    var backendBaseAddress = new Uri(builder.HostEnvironment.BaseAddress);
+
+    builder.Services.AddHttpClient("SecureApi", options => options.BaseAddress = backendBaseAddress)
         .AddHttpMessageHandler<CookieHandler>();
 
     builder.Services.AddHttpClient<IProductService, ProductService>(client =>
     {
-        client.BaseAddress = new Uri(builder.Configuration["BackendUrl"] ?? "https://localhost:5001");
+        client.BaseAddress = backendBaseAddress;
     });
 
     await builder.Build().RunAsync();
