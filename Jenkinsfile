@@ -101,7 +101,7 @@ pipeline {
                       --configuration Release \
                       --no-build \
                       -m:1 \
-                      --logger "trx;LogFileName=tests.trx" \
+                      --logger trx \
                       --results-directory TestResults \
                       --collect:"XPlat Code Coverage"
                 '''
