@@ -1,5 +1,9 @@
+using System.IO;
 using Destructurama;
 using FastEndpoints.Swagger;
+using Microsoft.AspNetCore.DataProtection;
+using Microsoft.AspNetCore.Diagnostics.HealthChecks;
+using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
 using Rise.Persistence;
@@ -10,108 +14,165 @@ using Rise.Services;
 using Rise.Services.Identity;
 using Serilog.Events;
 
+var migrateOnly = args.Any(argument =>
+    string.Equals(argument, "--migrate", StringComparison.OrdinalIgnoreCase));
+
 Log.Logger = new LoggerConfiguration()
     .MinimumLevel.Override("Microsoft", LogEventLevel.Information)
     .Enrich.FromLogContext()
     .WriteTo.Console()
-    .CreateBootstrapLogger(); // Initial log setup, will be overwritten by Serilog, but we need a logger before Dependency Injection is activated.
+    .CreateBootstrapLogger();
 
 try
 {
-    Log.Information("Starting web application");
+    Log.Information("Starting RISE web application");
     var builder = WebApplication.CreateBuilder(args);
 
+    var dataProtection = builder.Services
+        .AddDataProtection()
+        .SetApplicationName("Rise");
+    var keysPath = builder.Configuration["DataProtection:KeysPath"];
+    if (!string.IsNullOrWhiteSpace(keysPath))
+    {
+        dataProtection.PersistKeysToFileSystem(new DirectoryInfo(keysPath));
+    }
+
     builder.Services
-        .AddSerilog((_, lc) => lc.ReadFrom.Configuration(builder.Configuration) // Configuration in AppSettings.json
-            .Destructure.UsingAttributes()) // Sensitive data logging
-        .AddIdentity<IdentityUser, IdentityRole>() 
+        .AddSerilog((_, loggerConfiguration) => loggerConfiguration
+            .ReadFrom.Configuration(builder.Configuration)
+            .Destructure.UsingAttributes())
+        .AddIdentity<IdentityUser, IdentityRole>()
         .AddEntityFrameworkStores<ApplicationDbContext>()
-        .Services.AddDbContext<ApplicationDbContext>(o =>
+        .Services.AddDbContext<ApplicationDbContext>(options =>
         {
             var connectionString = builder.Configuration.GetConnectionString("DatabaseConnection") ??
-                                   throw new InvalidOperationException("Connection string 'DatabaseConnection' not found.");
-            o.UseSqlite(connectionString); // Swap Sqlite for your database provider (e.g. Sql Server, MySQL, PostgreSQL, etc.).
-            o.EnableDetailedErrors();
+                throw new InvalidOperationException(
+                    "Connection string 'DatabaseConnection' was not configured.");
+            options.UseNpgsql(connectionString);
+            options.EnableDetailedErrors();
             if (builder.Environment.IsDevelopment())
             {
-                o.EnableSensitiveDataLogging(); // only enabled in development.
+                options.EnableSensitiveDataLogging();
             }
-            o.UseTriggers(options => options.AddTrigger<EntityBeforeSaveTrigger>()); // Handles all UpdatedAt, CreatedAt stuff.
+
+            options.UseTriggers(triggerOptions =>
+                triggerOptions.AddTrigger<EntityBeforeSaveTrigger>());
         })
-        .ConfigureApplicationCookie(o =>
+        .ConfigureApplicationCookie(options =>
         {
-            o.Events.OnRedirectToLogin = ctx =>
+            options.Cookie.SecurePolicy = CookieSecurePolicy.Always;
+            options.Cookie.HttpOnly = true;
+            options.Cookie.SameSite = SameSiteMode.Lax;
+            options.Events.OnRedirectToLogin = context =>
             {
-                ctx.Response.StatusCode = StatusCodes.Status401Unauthorized;
+                context.Response.StatusCode = StatusCodes.Status401Unauthorized;
                 return Task.CompletedTask;
             };
-
-            o.Events.OnRedirectToAccessDenied = ctx =>
+            options.Events.OnRedirectToAccessDenied = context =>
             {
-                ctx.Response.StatusCode = StatusCodes.Status403Forbidden;
+                context.Response.StatusCode = StatusCodes.Status403Forbidden;
                 return Task.CompletedTask;
             };
         })
         .AddHttpContextAccessor()
-        .AddScoped<ISessionContextProvider, HttpContextSessionProvider>() // Provides the current user from the HttpContext to the session provider.
-        .AddApplicationServices() // You'll need to add your own services in this function call.
+        .AddScoped<ISessionContextProvider, HttpContextSessionProvider>()
+        .AddApplicationServices()
         .AddAuthorization()
-        .AddFastEndpoints(o =>
+        .AddFastEndpoints(options =>
         {
-            o.IncludeAbstractValidators = true; // Include validators from abstract classes (see https://docs.fluentvalidation.net/en/latest/).
-            o.Assemblies = [typeof(Rise.Shared.Products.ProductRequest).Assembly]; // Adds the validators from other assemblies
+            options.IncludeAbstractValidators = true;
+            options.Assemblies = [typeof(Rise.Shared.Products.ProductRequest).Assembly];
         })
-        .SwaggerDocument(o =>
+        .SwaggerDocument(options =>
         {
-            o.DocumentSettings = s =>
-            {
-                s.Title = "RISE API";
-            };
+            options.DocumentSettings = settings => settings.Title = "RISE API";
         });
 
+    builder.Services
+        .AddHealthChecks()
+        .AddDbContextCheck<ApplicationDbContext>("database", tags: ["ready"]);
+
+    builder.Services.Configure<ForwardedHeadersOptions>(options =>
+    {
+        options.ForwardedHeaders = ForwardedHeaders.XForwardedFor |
+                                   ForwardedHeaders.XForwardedProto |
+                                   ForwardedHeaders.XForwardedHost;
+        options.KnownNetworks.Clear();
+        options.KnownProxies.Clear();
+    });
+
     var app = builder.Build();
-    // apply Database migraticons on startup, not so wise in production (Use Generated SQL Scripts) 
-    // See: https://learn.microsoft.com/en-us/ef/core/managing-schemas/migrations/applying?tabs=dotnet-core-cli
+
+    if (migrateOnly)
+    {
+        await using var scope = app.Services.CreateAsyncScope();
+        var dbContext = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+        await dbContext.Database.MigrateAsync();
+
+        if (builder.Configuration.GetValue("SeedDemoData", false))
+        {
+            var dbSeeder = scope.ServiceProvider.GetRequiredService<DbSeeder>();
+            await dbSeeder.SeedAsync();
+        }
+
+        Log.Information("Database migration completed successfully");
+        return;
+    }
+
     if (app.Environment.IsDevelopment())
     {
-        using (var scope = app.Services.CreateScope())
-        {
-            var dbContext = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
-            var dbSeeder = scope.ServiceProvider.GetRequiredService<DbSeeder>();
-            // dbContext.Database.EnsureDeleted(); // Delete the database if it exists to clean it up if needed.
-
-            dbContext.Database.Migrate(); // Creates the database if it doesn't exist and applies all migrations. See Readme.md for more info.
-            await dbSeeder.SeedAsync(); // Seeds the database with some test data.
-        }
+        await using var scope = app.Services.CreateAsyncScope();
+        var dbContext = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+        await dbContext.Database.MigrateAsync();
+        var dbSeeder = scope.ServiceProvider.GetRequiredService<DbSeeder>();
+        await dbSeeder.SeedAsync();
     }
-    // Theses middlewares are strict in order of calling!
-    app.UseHttpsRedirection()
-        .UseBlazorFrameworkFiles() // Blazor is also served from the API. 
+
+    app.UseForwardedHeaders();
+    if (app.Environment.IsDevelopment())
+    {
+        app.UseHttpsRedirection();
+    }
+
+    app.UseBlazorFrameworkFiles()
         .UseStaticFiles()
         .UseDefaultExceptionHandler()
         .UseAuthentication()
         .UseAuthorization()
-        .UseFastEndpoints(o =>
+        .UseFastEndpoints(options =>
         {
-            o.Endpoints.Configurator = ep =>
+            options.Endpoints.Configurator = endpoint =>
             {
-                ep.DontAutoSendResponse();
-                ep.PreProcessor<GlobalRequestLogger>(Order.Before);
-                ep.PostProcessor<GlobalResponseSender>(Order.Before);
-                ep.PostProcessor<GlobalResponseLogger>(Order.Before);
+                endpoint.DontAutoSendResponse();
+                endpoint.PreProcessor<GlobalRequestLogger>(Order.Before);
+                endpoint.PostProcessor<GlobalResponseSender>(Order.Before);
+                endpoint.PostProcessor<GlobalResponseLogger>(Order.Before);
             };
         })
         .UseSwaggerGen();
-    app.MapFallbackToFile("index.html"); // Serves the Blazor app from the API, when no routes match.
-    app.Run();
+
+    app.MapHealthChecks("/health/live", new HealthCheckOptions
+    {
+        Predicate = _ => false
+    }).AllowAnonymous();
+    app.MapHealthChecks("/health/ready", new HealthCheckOptions
+    {
+        Predicate = registration => registration.Tags.Contains("ready")
+    }).AllowAnonymous();
+    app.MapFallbackToFile("index.html");
+    await app.RunAsync();
 }
-catch (Exception ex)
+catch (HostAbortedException)
 {
-    Log.Fatal(ex, "An unhandled exception occured during bootstrapping");
+    // EF Core stops the host after design-time service discovery. This is not
+    // an application failure and should not be logged as fatal.
+    Log.Debug("Host stopped after design-time service discovery");
+}
+catch (Exception exception)
+{
+    Log.Fatal(exception, "An unhandled exception occurred during bootstrapping");
 }
 finally
 {
-    Log.CloseAndFlush();
+    await Log.CloseAndFlushAsync();
 }
-
-

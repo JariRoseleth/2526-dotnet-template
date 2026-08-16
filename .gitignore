@@ -3,6 +3,14 @@ obj/
 /packages/
 riderModule.iml
 /_ReSharper.Caches/
+.idea/
+.vs/
+.vscode/
+TestResults/
+publish/
+*.tar.gz
+*.tar.gz.sha256
+compose.override.yml
 **/.DS_Store
 
 

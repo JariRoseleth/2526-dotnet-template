@@ -18,6 +18,8 @@
 
     <ItemGroup>
         <PackageReference Include="bunit" Version="1.40.0" />
+        <!-- Override bUnit's vulnerable transitive AngleSharp 1.2.0. -->
+        <PackageReference Include="AngleSharp" Version="1.7.1" PrivateAssets="all" />
         <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
         <PackageReference Include="coverlet.collector" Version="6.0.4">
             <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
